@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "mocha \"test/**/*.test.js\" --exit"
   },
   "keywords": [],
   "author": "",
@@ -16,5 +16,9 @@
     "eth-crypto": "^2.7.0",
     "ethers": "^6.13.5",
     "webrtc": "^1.14.1"
+  },
+  "devDependencies": {
+    "chai": "^5.2.0",
+    "mocha": "^11.1.0"
   }
 }

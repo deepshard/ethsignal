@@ -2,34 +2,25 @@ import dotenv from "dotenv";
 import fs from "fs";
 import { ethers } from "ethers";
 import EthCrypto from "eth-crypto";
-import { SignalServerSdk } from "./sdk/SignalServerSDK.js";
+import { SignalServerSdk } from "../sdk/SignalServerSDK.js";
 
 dotenv.config();
 
 // --- Configuration (from your .env) ---
-const RPC_URL          = process.env.RPC_URL;
-const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
-const ALICE_PK         = process.env.ALICE_PRIVATE_KEY;
-const BOB_PK           = process.env.BOB_PRIVATE_KEY;
-const ABI_PATH         = "./SignalServer.json";
+const ALICE_PK = process.env.ALICE_PRIVATE_KEY;
+const BOB_PK   = process.env.BOB_PRIVATE_KEY;
 
 // Validate
-if (!RPC_URL || !CONTRACT_ADDRESS || !ALICE_PK || !BOB_PK) {
-  throw new Error("Missing one of RPC_URL, CONTRACT_ADDRESS, ALICE_PRIVATE_KEY, BOB_PRIVATE_KEY");
+if (!ALICE_PK || !BOB_PK) {
+  throw new Error("Missing ALICE_PRIVATE_KEY or BOB_PRIVATE_KEY");
 }
 
-// Load ABI
-const contractJson = JSON.parse(fs.readFileSync(ABI_PATH, "utf8"));
-const CONTRACT_ABI  = contractJson.abi;
-
 // --- Ethers + Wallets ---
-const provider    = new ethers.JsonRpcProvider(RPC_URL);
+const provider    = new ethers.JsonRpcProvider();
 const aliceWallet = new ethers.Wallet(ALICE_PK, provider);
 const bobWallet   = new ethers.Wallet(BOB_PK,   provider);
 
 console.log("On‑chain setup:");
-console.log("  RPC:",      RPC_URL);
-console.log("  Contract:", CONTRACT_ADDRESS);
 console.log("  Alice →",   aliceWallet.address);
 console.log("  Bob   →",   bobWallet.address);
 
@@ -41,41 +32,24 @@ console.log("\nEncryption identities:");
 console.log("  Alice pubKey:", aliceIdentity.publicKey);
 console.log("  Bob   pubKey:", bobIdentity.publicKey);
 
-// --- TURN only (no STUN) ---
-const ICE_SERVERS = [
-  {
-    urls:       "turn:localhost:3478",
-    username:   "testuser",
-    credential: "testpass"
-  }
-];
-
 async function main() {
   // build a true address→publicKey map
-  const aliceToBobMap = { [bobWallet.address]: bobIdentity.publicKey };
-  const bobToAliceMap = { [aliceWallet.address]: aliceIdentity.publicKey };
+  const aliceToBob = { [bobWallet.address]: bobIdentity.publicKey };
+  const bobToAlice = { [aliceWallet.address]: aliceIdentity.publicKey };
 
   // --- Instantiate two SDKs ---
   const sdkAlice = new SignalServerSdk({
-    provider,
-    wallet: aliceWallet,
+    wallet:             aliceWallet,
     encryptionIdentity: aliceIdentity,
-    peerPublicKeys: aliceToBobMap,
-    contractAddress: CONTRACT_ADDRESS,
-    contractAbi: CONTRACT_ABI,
-    iceServers: ICE_SERVERS,
-    timeoutMs: 20000,  // 20s
+    peerPublicKeys:     aliceToBob,
+    timeoutMs:          60_000,
   });
 
   const sdkBob = new SignalServerSdk({
-    provider,
-    wallet: bobWallet,
+    wallet:             bobWallet,
     encryptionIdentity: bobIdentity,
-    peerPublicKeys: bobToAliceMap,
-    contractAddress: CONTRACT_ADDRESS,
-    contractAbi: CONTRACT_ABI,
-    iceServers: ICE_SERVERS,
-    timeoutMs: 20000,
+    peerPublicKeys:     bobToAlice,
+    timeoutMs:          60_000,
   });
 
   // ─────────────────────────────────────────────────────────────────  
@@ -104,8 +78,18 @@ async function main() {
     console.log(`  • timestamp:   ${new Date(req.timestamp).toISOString()}`);
     console.log(`  • offer SDP:   ${req.offer.sdp}`);
     console.log(`  • publicKey:   ${req.publicKey}`);
-    await req.accept();
-    console.log("[Bob SDK] Sent answer, waiting for stream…");
+
+    try {
+      const stream = await req.accept();
+      console.log(`[Bob SDK] Data‑channel open with ${stream.remoteAddress}`);
+      stream.onMessage(async (msg) => {
+        console.log(`[Bob SDK] got message:`, msg);
+        await stream.respond("Hi Alice, got your message! -Bob");
+      });
+      stream.onFile(buf => console.log(`[Bob SDK] got file (${buf.length} bytes)`));
+    } catch (err) {
+      console.error("[Bob SDK] Help‑accept timed out:", err);
+    }
   });
 
   // --- Both sides listen for stream open and wire up message/file handlers ---

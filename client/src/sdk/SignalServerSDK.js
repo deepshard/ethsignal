@@ -1,6 +1,8 @@
 import { ethers } from "ethers";
 import EthCrypto from "eth-crypto";
 import wrtc from "@roamhq/wrtc";
+import dotenv from "dotenv";
+dotenv.config();
 
 /**
  * DataStream wraps a WebRTC data‑channel, enforcing
@@ -49,37 +51,50 @@ class RequestForHelp {
     this.sender    = sender;
     this.offer     = offer;      // { type, sdp, candidates }
     this.timestamp = Date.now();
+
+    // so you know which key to use when encrypting your answer
+    this.publicKey = sdk._getPeerPubKey(sender);
   }
 
   async accept() {
+    // create a peer‑connection for the answer
     const pc = new wrtc.RTCPeerConnection({ iceServers: this._sdk.iceServers });
 
-    // ─── 1) Listen for the remote channel that Alice (the offerer) created
+    // we'll return this once the data‑channel is open
+    let resolveStream, rejectStream;
+    const p2pPromise = new Promise((res, rej) => {
+      resolveStream = res;
+      rejectStream  = rej;
+    });
+
+    // 1) listen for the DataChannel that Alice created
     pc.ondatachannel = (evt) => {
       const dc = evt.channel;
       const stream = new DataStream(this.sender, dc);
       dc.onopen = () => {
+        clearTimeout(timeout);
         this._sdk._notifyStreamOpen(stream);
+        resolveStream(stream);
       };
     };
 
-    // ─── 2) Collect our own ICE candidates to bundle in the answer
+    // 2) gather our ICE candidates
     const candidates = [];
     pc.onicecandidate = (evt) => {
       if (evt.candidate) candidates.push(evt.candidate);
     };
 
-    // ─── 3) Set Alice's offer + her ICE candidates
+    // 3) set Alice's offer
     await pc.setRemoteDescription({ type: this.offer.type, sdp: this.offer.sdp });
     for (const c of this.offer.candidates || []) {
       await pc.addIceCandidate(c);
     }
 
-    // ─── 4) Create and set our bundled answer
+    // 4) create & set our answer
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
 
-    // ─── 5) Wait for ICE gathering to finish
+    // 5) wait for ICE gathering to finish
     await new Promise(res => {
       if (pc.iceGatheringState === "complete") return res();
       pc.onicegatheringstatechange = () => {
@@ -87,16 +102,71 @@ class RequestForHelp {
       };
     });
 
-    // ─── 6) Send exactly one on‑chain answer tx
+    // 6) send exactly one on‑chain answer
     await this._sdk._sendSignal(this.sender, {
       type:       answer.type,
       sdp:        pc.localDescription.sdp,
-      candidates // bundled ICECandidateInit[]
+      candidates
     });
+
+    // 7) enforce a timeout for the data‑channel open
+    const timeout = setTimeout(() => {
+      pc.close();
+      rejectStream(new Error("HelpAcceptTimeout"));
+    }, this._sdk.timeoutMs);
+
+    return p2pPromise;
   }
 
-  reject() { /* no-op */ }
+  reject() { /* no‑op */ }
 }
+
+// ─── DEFAULTS ────────────────────────────────────────────────────────
+// Hard‑coded ABI for SignalServer
+const DEFAULT_CONTRACT_ABI = [
+  {
+    type: "function",
+    name: "sendSignal",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "_recipient", type: "address" },
+      { name: "_encryptedData", type: "bytes" },
+    ],
+  },
+  {
+    type: "event",
+    name: "SignalSent",
+    anonymous: false,
+    inputs: [
+      { name: "sender", type: "address", indexed: true },
+      { name: "recipient", type: "address", indexed: true },
+      { name: "encryptedData", type: "bytes", indexed: false },
+    ],
+  },
+];
+
+// Default JSON‑RPC (take from .env or fall back to localhost)
+const DEFAULT_PROVIDER = new ethers.JsonRpcProvider(
+  process.env.RPC_URL || "http://localhost:8545"
+);
+
+// SignalServer address comes from .env
+const DEFAULT_CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
+if (!DEFAULT_CONTRACT_ADDRESS) {
+  throw new Error(
+    "SignalServerSdk: missing CONTRACT_ADDRESS in .env"
+  );
+}
+
+// Metered STUN/TURN list
+const DEFAULT_ICE_SERVERS = [
+  { urls: "stun:stun.relay.metered.ca:80" },
+  { urls: "turn:global.relay.metered.ca:80", username: "2bfc0400157f3c5d6af0de73", credential: "XvWgF3CnBaSgbcvH" },
+  { urls: "turn:global.relay.metered.ca:80?transport=tcp", username: "2bfc0400157f3c5d6af0de73", credential: "XvWgF3CnBaSgbcvH" },
+  { urls: "turn:global.relay.metered.ca:443", username: "2bfc0400157f3c5d6af0de73", credential: "XvWgF3CnBaSgbcvH" },
+  { urls: "turns:global.relay.metered.ca:443?transport=tcp", username: "2bfc0400157f3c5d6af0de73", credential: "XvWgF3CnBaSgbcvH" },
+];
+// ────────────────────────────────────────────────────────────────────
 
 /**
  * The main SDK class.
@@ -138,30 +208,59 @@ class RequestForHelp {
  *      .catch(err => console.error("no response / timed out", err));
  */
 export class SignalServerSdk {
-  constructor({
-    provider,
-    wallet,
-    encryptionIdentity,
-    contractAddress,
-    contractAbi,
-    peerPublicKeys = {},          // ← NEW: map address→X25519 publicKey
-    iceServers = [{ urls: "stun:stun.l.google.com:19302" }],
-    timeoutMs  = 20000,
-  }) {
-    this.provider  = provider;
-    this.wallet    = wallet.connect(provider);
-    this.identity  = encryptionIdentity;
-    this.peerPublicKeys = peerPublicKeys;    // ← store the map
-    this.contract  = new ethers.Contract(contractAddress, contractAbi, provider);
-    this.contractWithSigner = this.contract.connect(this.wallet);
+  // allow injecting a contract instance (e.g. FakeContract) and auto‑attach listeners
+  get contract() {
+    return this._contract;
+  }
+  set contract(c) {
+    this._contract = c;
+    this._startContractListeners();
+  }
 
+  /**
+   * @param {object} opts
+   * @param {ethers.Wallet} [opts.wallet]            – if omitted, one is created
+   * @param {object}        opts.peerPublicKeys      – { address: x25519PubKey }
+   * @param {object} [opts.encryptionIdentity]        – if omitted, one is generated
+   * @param {ethers.Provider} [opts.provider]         – defaults to local
+   * @param {string}          [opts.contractAddress] – your SignalServer
+   * @param {array}           [opts.contractAbi]     – hard‑coded ABI
+   * @param {array}           [opts.iceServers]      – defaults to Metered list
+   * @param {number}          [opts.timeoutMs]       – defaults to 20000 ms
+   */
+  constructor({
+    wallet,
+    peerPublicKeys,
+    encryptionIdentity,
+    provider         = DEFAULT_PROVIDER,
+    contractAddress  = DEFAULT_CONTRACT_ADDRESS,
+    contractAbi      = DEFAULT_CONTRACT_ABI,
+    iceServers       = DEFAULT_ICE_SERVERS,
+    timeoutMs        = 20000,    // shortened for test timeouts
+  }) {
+    if (!peerPublicKeys || Object.keys(peerPublicKeys).length === 0) {
+      throw new Error("SignalServerSdk: peerPublicKeys map is required");
+    }
+
+    // 1) Wallet & signer
+    this.wallet = wallet || ethers.Wallet.createRandom();
+    this.signer = this.wallet.connect(provider);
+
+    // 2) Provider + contract (setter will auto‑attach listeners)
+    this.contract           = new ethers.Contract(contractAddress, contractAbi, provider);
+    this.contractWithSigner = this.contract.connect(this.signer);
+
+    // 3) Encryption identity + peer keys
+    this.identity        = encryptionIdentity || EthCrypto.createIdentity();
+    this.peerPublicKeys  = peerPublicKeys;
+
+    // 4) Defaults
     this.iceServers = iceServers;
     this.timeoutMs  = timeoutMs;
 
+    // 5) Callbacks
     this._helpCb   = null;
     this._streamCb = null;
-
-    this._startContractListeners();
   }
 
   // PUBLIC API --------------------------------------------------------
@@ -212,7 +311,7 @@ export class SignalServerSdk {
       candidates // array of ICECandidateInit
     });
 
-    // wait for on‐chain answer
+    // wait for on‑chain answer
     const filter = this.contract.filters.SignalSent(toAddr, this.wallet.address);
     const onAnswer = async (...args) => {
       const ev         = args[args.length - 1];
